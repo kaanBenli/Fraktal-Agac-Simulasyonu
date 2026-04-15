@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="tr">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Fraktal Ağaç</title>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            background: #071124;
+            font-family: Inter, system-ui;
+        }
+        canvas { display: block; }
+        
+        #panel {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 200px;
+            background: rgba(20,22,40,0.85);
+            backdrop-filter: blur(6px);
+            padding: 14px;
+            border-radius: 12px;
+            color: #fff;
+            box-shadow: 0 0 12px rgba(0,0,0,0.35);
+            font-size: 13px;
+            z-index: 9999;
+        }
+        #panel h2 {
+            margin: 0 0 8px 0;
+            font-size: 15px;
+            font-weight: 600;
+        }
+        .label {
+            font-size: 12px;
+            opacity: 0.85;
+            margin-top: 8px;
+            margin-bottom: 3px;
+        }
+        input[type=range] { width: 100%; }
+        button {
+            width: 100%;
+            padding: 8px 0;
+            margin-top: 10px;
+            background: #4ade80;
+            color: #000;
+            border: none;
+            border-radius: 7px;
+            font-weight: 600;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        button:hover { background: #22c55e; }
+        small {
+            display: block;
+            opacity: 0.6;
+            margin-top: 6px;
+            font-size: 10px;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div id="panel">
+    <h2>Fraktal Ağaç</h2>
+    <div>Yaprak renkleri 5s: pembe → yeşil → turuncu → beyaz</div>
+    
+    <div class="label">Derinlik: <span id="depthVal">7</span></div>
+    <input type="range" id="depth" min="4" max="10" value="7">
+    
+    <div class="label">Başlangıç Uzunluğu: <span id="lenVal">160</span></div>
+    <input type="range" id="length" min="80" max="250" value="160">
+    
+    <div class="label">Rüzgar Yoğunluğu: <span id="windVal">0.60</span></div>
+    <input type="range" id="wind" min="0.1" max="1.2" step="0.01" value="0.60">
+    
+    <button id="resetAll" style="background:#60a5fa;">Ağacı Yenile + Döngüyü Başa Al</button>
+    <small>Derinlik 9+ olursa FPS düşebilir.</small>
+</div>
+
+<audio id="windSound" src="https://cdn.pixabay.com/download/audio/2022/03/15/audio_ea3c84f495.mp3" loop></audio>
+
+<script>
+    /* ================================================================
+       CANVAS + GLOBALS
+    ================================================================ */
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    let W = canvas.width = innerWidth;
+    let H = canvas.height = innerHeight;
+    addEventListener("resize", () => { 
+        W = canvas.width = innerWidth; 
+        H = canvas.height = innerHeight; 
+        buildTree(); 
+    });
+    const windAudio = document.getElementById("windSound"); 
+    windAudio.volume = 0.0;
+
+    /* ---------------------------------------------------------------
+       ZOOM & PAN
+    ---------------------------------------------------------------- */
+    let scale = 1, 
+        translateX = 0, 
+        translateY = 0, 
+        isDragging = false, 
+        lastX = 0, 
+        lastY = 0, 
+        userInteractionEnabled = true;
+
+    canvas.addEventListener("wheel", (e) => {
+        if (!userInteractionEnabled) return;
+        e.preventDefault();
+        const zoomIntensity = 0.04;
+        const mouseX = (e.clientX - translateX) / scale;
+        const mouseY = (e.clientY - translateY) / scale;
+        e.deltaY < 0 ? scale *= (1 + zoomIntensity) : scale = Math.max(0.2, scale * (1 - zoomIntensity));
+        translateX = e.clientX - mouseX * scale;
+        translateY = e.clientY - mouseY * scale;
+    });
+
+    canvas.addEventListener("mousedown", (e) => {
+        if (!userInteractionEnabled) return;
+        isDragging = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+    });
+    canvas.addEventListener("mouseup", () => isDragging = false);
+    canvas.addEventListener("mouseleave", () => isDragging = false);
+    canvas.addEventListener("mousemove", (e) => {
+        if (isDragging && userInteractionEnabled) {
+            translateX += e.clientX - lastX;
+            translateY += e.clientY - lastY;
+            lastX = e.clientX;
+            lastY = e.clientY;
+        }
+    });
+
+    /* ---------------------------------------------------------------
+       AUTO-ZOOM
+    ---------------------------------------------------------------- */
+    const AUTO_ZOOM_DELAY_AFTER_SNOW_START = 2000,
+          AUTO_ZOOM_IN_MS = 1200,
+          AUTO_ZOOM_HOLD_MS = 2000,
+          AUTO_ZOOM_OUT_MS = 1200,
+          AUTO_ZOOM_MAX_SCALE = 1.7;
+
+    let autoZoom = false,
+        zoomTarget = null,
+        autoZoomStartTime = 0,
+        savedCamera = { scale: 1, tx: 0, ty: 0 };
+
+    function easeInOutQuad(t) { return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; }
+
+    function scheduleAutoZoomForRandomFlake() {
+        const baseX = W / 2, baseY = H - 80;
+        const candidates = snow.filter(s => !s.removed);
+        if (candidates.length === 0) return;
+        candidates.forEach(f => { f.dist = Math.hypot(f.x - baseX, f.y - baseY); });
+        const closest = candidates.sort((a, b) => a.dist - b.dist).slice(0, 5);
+        const flake = closest[Math.floor(Math.random() * closest.length)];
+        startAutoZoom(flake);
+    }
+
+    function startAutoZoom(flake) {
+        if (!flake || autoZoom) return;
+        zoomTarget = flake;
+        autoZoom = true;
+        autoZoomStartTime = performance.now();
+        savedCamera = { scale: scale, tx: translateX, ty: translateY };
+        userInteractionEnabled = false;
+    }
+
+    function updateAutoZoom(now) {
+        if (!autoZoom || !zoomTarget) return;
+        if (zoomTarget.removed) { cancelAutoZoom(); return; }
+        const elapsed = now - autoZoomStartTime;
+        const total = AUTO_ZOOM_IN_MS + AUTO_ZOOM_HOLD_MS + AUTO_ZOOM_OUT_MS;
+        if (elapsed >= total) { cancelAutoZoom(); return; }
+
+        if (elapsed <= AUTO_ZOOM_IN_MS) {
+            const t = easeInOutQuad(elapsed / AUTO_ZOOM_IN_MS);
+            scale = savedCamera.scale + (AUTO_ZOOM_MAX_SCALE - savedCamera.scale) * t;
+        } else if (elapsed <= AUTO_ZOOM_IN_MS + AUTO_ZOOM_HOLD_MS) {
+            scale = AUTO_ZOOM_MAX_SCALE;
+        } else {
+            const t = easeInOutQuad((elapsed - AUTO_ZOOM_IN_MS - AUTO_ZOOM_HOLD_MS) / AUTO_ZOOM_OUT_MS);
+            scale = AUTO_ZOOM_MAX_SCALE + (savedCamera.scale - AUTO_ZOOM_MAX_SCALE) * t;
+        }
+
+        const centerX = W / 2, centerY = H / 2;
+        translateX = centerX - (zoomTarget.x * scale);
+        translateY = centerY - (zoomTarget.y * scale);
+    }
+
+    function cancelAutoZoom() {
+        autoZoom = false;
+        zoomTarget = null;
+        userInteractionEnabled = true;
+        translateX = savedCamera.tx;
+        translateY = savedCamera.ty;
+        scale = savedCamera.scale;
+    }
+
+    /* ---------------------------------------------------------------
+       UI
+    ---------------------------------------------------------------- */
+    const ui = {
+        depth: document.getElementById("depth"),
+        length: document.getElementById("length"),
+        wind: document.getElementById("wind"),
+        depthVal: document.getElementById("depthVal"),
+        lenVal: document.getElementById("lenVal"),
+        windVal: document.getElementById("windVal"),
+        resetAll: document.getElementById("resetAll")
+    };
+
+    ui.depth.oninput = () => ui.depthVal.textContent = ui.depth.value;
+    ui.length.oninput = () => ui.lenVal.textContent = ui.length.value;
+    ui.wind.oninput = () => ui.windVal.textContent = ui.wind.value;
+
+    /* ---------------------------------------------------------------
+       RENKLER VE DİĞER DİZİLER
+    ---------------------------------------------------------------- */
+    const leafColors = ['#ff8fbf', '#6bd26b', '#ffb86b', '#ffffff'];
+    let colorIndex = 0;
+    let leafSeed = Math.random() * 1000;
+
+    setInterval(() => {
+        if (colorIndex < leafColors.length - 1) colorIndex++;
+        leafSeed = Math.random() * 1000;
+        if (colorIndex === 3) startSnow();
+    }, 5000);
+
+    let branches = [], leaves = [], fallingLeaves = [], dustParticles = [], windStreams = [], snow = [], fruits = [];
+    const rand = (a, b) => a + Math.random() * (b - a);
+
+    /* ---------------------------------------------------------------
+       AĞAÇ OLUŞTURMA
+    ---------------------------------------------------------------- */
+    function buildTree() {
+        branches = []; leaves = []; fallingLeaves = []; dustParticles = []; windStreams = []; snow = []; fruits = [];
+        const root = {
+            x: W / 2,
+            y: H - 20,
+            len: Number(ui.length.value),
+            angle: -Math.PI / 2,
+            depth: Number(ui.depth.value),
+            thickness: 10
+        };
+        generateBranch(root);
+    }
+
+    function generateBranch(b) {
+        branches.push(b);
+        if (b.depth <= 0) {
+            leaves.push(createLeaf(b));
+            if (Math.random() < 0.3) fruits.push(createFruit(b));
+            return;
+        }
+
+        const x2 = b.x + Math.cos(b.angle) * b.len;
+        const y2 = b.y + Math.sin(b.angle) * b.len;
+        const split = 2 + (Math.random() < 0.2 ? 1 : 0);
+
+        for (let i = 0; i < split; i++) {
+            const angleOffset = (i - (split - 1) / 2) * rand(0.3, 0.55);
+            generateBranch({
+                x: x2,
+                y: y2,
+                len: b.len * rand(0.6, 0.78),
+                angle: b.angle + angleOffset,
+                depth: b.depth - 1,
+                thickness: b.thickness * rand(0.55, 0.8)
+            });
+        }
+    }
+
+    /* ---------------------------------------------------------------
+       DAL ÇİZİMİ f(t) FORMÜLÜ (Bézier Kübik)
+    ---------------------------------------------------------------- */
+    function drawBranch(b) {
+        ctx.lineWidth = b.thickness;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = `hsl(25,30%,${20 + b.depth * 5}%)`;
+
+        const windStrength = Number(ui.wind.value);
+        const wind = Math.sin(performance.now() * 0.001 + b.depth) * 0.05 * windStrength;
+
+        const x0 = b.x, y0 = b.y;
+        const x3 = b.x + Math.cos(b.angle + wind) * b.len;
+        const y3 = b.y + Math.sin(b.angle + wind) * b.len;
+
+        const cpLen = b.len * 0.3;
+        const P0 = { x: x0, y: y0 };
+        const P1 = {
+            x: x0 + Math.cos(b.angle + wind) * cpLen - Math.sin(b.angle) * cpLen * 0.5,
+            y: y0 + Math.sin(b.angle + wind) * cpLen + Math.cos(b.angle) * cpLen * 0.5
+        };
+        const P2 = {
+            x: x0 + Math.cos(b.angle + wind) * cpLen * 2 + Math.sin(b.angle) * cpLen * 0.5,
+            y: y0 + Math.sin(b.angle + wind) * cpLen * 2 - Math.cos(b.angle) * cpLen * 0.5
+        };
+        const P3 = { x: x3, y: y3 };
+
+        const segments = 50;
+        ctx.beginPath();
+        for (let i = 0; i <= segments; i++) {
+            const t = i / segments;
+            const xt = (1-t)**3*P0.x + 3*(1-t)**2*t*P1.x + 3*(1-t)*t**2*P2.x + t**3*P3.x;
+            const yt = (1-t)**3*P0.y + 3*(1-t)**2*t*P1.y + 3*(1-t)*t**2*P2.y + t**3*P3.y;
+            if (i === 0) ctx.moveTo(xt, yt);
+            else ctx.lineTo(xt, yt);
+        }
+        ctx.stroke();
+    }
+
+    /* ---------------------------------------------------------------
+       MEYVELER VE YAPRAKLAR
+    ---------------------------------------------------------------- */
+    function createFruit(b) {
+        const x = b.x + Math.cos(b.angle) * b.len;
+        const y = b.y + Math.sin(b.angle) * b.len;
+        return { x, y, r: rand(3,6), swayOffset: Math.random() * 10 };
+    }
+
+    function drawFruit(f) {
+        const t = performance.now() * 0.001;
+        const windSway = Math.sin(t * 2 + f.swayOffset) * 1.2 * Number(ui.wind.value);
+        ctx.fillStyle = "red";
+        ctx.beginPath();
+        ctx.arc(f.x + windSway, f.y, f.r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    function createLeaf(b) {
+        const x = b.x + Math.cos(b.angle) * b.len;
+        const y = b.y + Math.sin(b.angle) * b.len;
+        return {
+            x, y, baseX: x, baseY: y,
+            angle: b.angle,
+            scale: rand(0.6, 1.2),
+            swayOffset: Math.random() * 10,
+            falling: false, vx: 0, vy: 0
+        };
+    }
+
+    function drawLeaf(l, color) {
+        const t = performance.now() * 0.001;
+        let windSway = Math.sin(t * 2 + l.swayOffset) * 3 * Number(ui.wind.value);
+        const allowFall = colorIndex === 2;
+
+        if (l.falling) {
+            l.vx += 0.01;
+            l.vy += 0.04;
+            l.x += l.vx + windSway * 0.05;
+            l.y += l.vy;
+            if (l.y > H - 10) { l.y = H - 10; l.vx *= 0.6; l.vy *= 0.4; }
+        } else {
+            l.x = l.baseX + windSway;
+            l.y = l.baseY + Math.sin(t + l.swayOffset) * 1.4;
+            if (allowFall && Math.random() < 0.01) {
+                l.falling = true;
+                fallingLeaves.push(l);
+            }
+        }
+
+        const len = 20 * l.scale, w = 7 * l.scale, angle = l.angle;
+        ctx.fillStyle = color;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 12;
+
+        const x0 = l.x, y0 = l.y;
+        const x3 = x0 + Math.cos(angle) * len;
+        const y3 = y0 + Math.sin(angle) * len;
+
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.bezierCurveTo(
+            x0 + Math.cos(angle) * len * 0.3 + Math.cos(angle + 1.57) * w,
+            y0 + Math.sin(angle) * len * 0.3 + Math.sin(angle + 1.57) * w,
+            x3 - Math.cos(angle) * len * 0.3 + Math.cos(angle + 1.57) * w * 0.3,
+            y3 - Math.sin(angle) * len * 0.3 + Math.sin(angle + 1.57) * w * 0.3,
+            x3, y3
+        );
+        ctx.bezierCurveTo(
+            x3 - Math.cos(angle) * len * 0.3 + Math.cos(angle - 1.57) * w * 0.3,
+            y3 - Math.sin(angle) * len * 0.3 + Math.sin(angle - 1.57) * w * 0.3,
+            x0 + Math.cos(angle) * len * 0.3 + Math.cos(angle - 1.57) * w,
+            y0 + Math.sin(angle) * len * 0.3 + Math.sin(angle - 1.57) * w,
+            x0, y0
+        );
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+
+    /* ---------------------------------------------------------------
+       TOZ, RÜZGAR, KAR
+    ---------------------------------------------------------------- */
+    function createDust() {
+        if (colorIndex !== 2) return;
+        for (let i = 0; i < 4; i++) {
+            dustParticles.push({
+                x: rand(0, W),
+                y: H - rand(0, 40),
+                vx: rand(0.4, 1.2),
+                vy: rand(-1.5, -0.3),
+                life: rand(0.6, 1.0)
+            });
+        }
+    }
+
+    function drawDust(d) {
+        const wind = Number(ui.wind.value);
+        d.x += d.vx * wind * 1.5;
+        d.y += d.vy - Math.sin(d.x * 0.01) * 0.4;
+        d.life -= 0.01;
+        ctx.fillStyle = `rgba(200,180,150,${d.life})`;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, 2, 0, Math.PI * 2);
+        ctx.fill();
+        return d.life > 0;
+    }
+    setInterval(createDust, 250);
+
+    function createWindStream() {
+        if (colorIndex !== 2) return;
+        const y = rand(60, H - 200);
+        const speed = rand(1.2, 2.4);
+        windStreams.push({ x: -200, y, life: 1, speed, w: rand(200, 350) });
+    }
+
+    function drawWindStream(ws) {
+        ws.life -= 0.006;
+        if (ws.life <= 0) return false;
+        ws.x += ws.speed;
+        const x2 = ws.x + ws.w;
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = `rgba(180,200,255,${ws.life})`;
+        ctx.beginPath();
+        ctx.moveTo(ws.x, ws.y);
+        ctx.bezierCurveTo(ws.x + ws.w * 0.25, ws.y - 40, ws.x + ws.w * 0.75, ws.y + 60, x2, ws.y);
+        ctx.stroke();
+        return true;
+    }
+    setInterval(() => { if (colorIndex === 2) createWindStream(); }, 350);
+
+    let snowing = false;
+
+    function startSnow() {
+        if (snowing) return;
+        snowing = true;
+        setTimeout(() => { scheduleAutoZoomForRandomFlake(); }, AUTO_ZOOM_DELAY_AFTER_SNOW_START);
+        setTimeout(() => { snowing = false; }, 5000);
+    }
+
+    function createSnowFlake() {
+        if (!snowing) return;
+        snow.push({
+            x: rand(0, W),
+            y: rand(-20, -5),
+            r: rand(2, 5),
+            vy: rand(0.6, 1.4),
+            drift: rand(-0.4, 0.4),
+            life: 1,
+            removed: false
+        });
+    }
+
+    function drawSnow(s) {
+        const speedFactor = 1 / scale;
+        s.y += s.vy * speedFactor;
+        s.x += s.drift * speedFactor;
+        if (s.y > H) { s.removed = true; return false; }
+        ctx.fillStyle = "rgba(255,255,255,1)";
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+        ctx.fill();
+        return true;
+    }
+    setInterval(createSnowFlake, 80);
+
+    function updateWindSound() {
+        if (colorIndex === 2) {
+            windAudio.volume = Math.min(windAudio.volume + 0.01, 0.35);
+            if (windAudio.paused) windAudio.play();
+        } else {
+            windAudio.volume = Math.max(windAudio.volume - 0.02, 0);
+            if (windAudio.volume === 0 && !windAudio.paused) windAudio.pause();
+        }
+    }
+
+    /* ---------------------------------------------------------------
+       ÇİZİM DÖNGÜSÜ
+    ---------------------------------------------------------------- */
+    function draw(now) {
+        now = now || performance.now();
+        updateAutoZoom(now);
+        if (!userInteractionEnabled) isDragging = false;
+
+        ctx.clearRect(0, 0, W, H);
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0, "#071124");
+        g.addColorStop(1, "#03111a");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.save();
+        ctx.translate(translateX, translateY);
+        ctx.scale(scale, scale);
+
+        branches.forEach(drawBranch);
+        const color = leafColors[colorIndex];
+        leaves.forEach(l => drawLeaf(l, color));
+        fallingLeaves.forEach(l => drawLeaf(l, color));
+        if (colorIndex === 1) fruits.forEach(drawFruit);
+
+        dustParticles = dustParticles.filter(d => drawDust(d));
+        windStreams = windStreams.filter(ws => drawWindStream(ws));
+        snow = snow.filter(s => drawSnow(s));
+
+        ctx.restore();
+        updateWindSound();
+        requestAnimationFrame(draw);
+    }
+
+    ui.resetAll.onclick = () => {
+        colorIndex = 0;
+        leafSeed = Math.random() * 1000;
+        snow = []; snowing = false;
+        fallingLeaves = []; dustParticles = []; windStreams = []; fruits = [];
+        scale = 1; translateX = 0; translateY = 0;
+        autoZoom = false; zoomTarget = null; userInteractionEnabled = true;
+        buildTree();
+    };
+
+    /* ---------------------------------------------------------------
+       BAŞLAT
+    ---------------------------------------------------------------- */
+    buildTree();
+    requestAnimationFrame(draw);
+</script>
+
+</body>
+</html>
